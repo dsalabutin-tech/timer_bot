@@ -43,6 +43,9 @@ TZ = ZoneInfo("Europe/Moscow")
 # Кэш подписчиков (загружается из БД при старте)
 _subscribers: set[int] = set()
 
+# Флаг отправки уведомлений (ON/OFF). При OFF бот считает таймеры, но не шлёт сообщения.
+_notifications_enabled: bool = True
+
 
 def load_subscribers_from_db():
     """Загрузить подписчиков из БД в кэш."""
@@ -262,6 +265,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 ━━━━━━━━━━━━━━━━━━━━
 
+🔔 **/on** / **/off**
+Админы: Включить/выключить уведомления.
+При OFF бот считает таймеры, но не шлёт сообщения.
+
+━━━━━━━━━━━━━━━━━━━━
+
 💡 *Время: Moscow (UTC+3)*
 
 ✅ Вы автоматически подписаны на уведомления о респах!
@@ -382,7 +391,7 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             Boss.first_spawn_minutes <= 5
         ).all()
         
-        if fast_bosses and _subscribers:
+        if fast_bosses and _subscribers and _notifications_enabled:
             for boss in fast_bosses:
                 spawn_time = dt + timedelta(minutes=boss.first_spawn_minutes or 0)
                 # Отправляем уведомление только если spawn_time в будущем (или очень близко)
@@ -881,6 +890,26 @@ async def cmd_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(f"✅ {del_admin} удалён из админов.")
 
 
+async def cmd_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Включить отправку уведомлений."""
+    global _notifications_enabled
+    if not is_admin(update.effective_user):
+        await update.message.reply_text("⛔ Недостаточно прав")
+        return
+    _notifications_enabled = True
+    await update.message.reply_text("✅ Уведомления включены (ON). Бот отправляет сообщения в чат.")
+
+
+async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Выключить отправку уведомлений. Таймеры продолжают считаться."""
+    global _notifications_enabled
+    if not is_admin(update.effective_user):
+        await update.message.reply_text("⛔ Недостаточно прав")
+        return
+    _notifications_enabled = False
+    await update.message.reply_text("🔇 Уведомления выключены (OFF). Бот продолжает считать таймеры, но не отправляет сообщения.")
+
+
 _sent_notifications: set[tuple[int, str, int]] = set()  # (boss_id, spawn_key, minutes_before)
 
 
@@ -948,23 +977,25 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                 notification_key = (boss.id, key_base, 0)
                 if notification_key not in _sent_notifications:
                     _sent_notifications.add(notification_key)
-                    time_str = format_time_short(nxt)
-                    message = f"🔴 Босс появился:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
-                    
-                    for chat_id in list(_subscribers):
-                        try:
-                            sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
-                            # Удалить сообщение через 4 минут
-                            context.job_queue.run_once(
-                                delete_message_job,
-                                when=240,
-                                data={"chat_id": chat_id, "message_id": sent_msg.message_id}
-                            )
-                        except Exception as e:
-                            logger.error(f"Не удалось отправить в {chat_id}: {e}")
-                            # _subscribers.discard(chat_id)
-                    
-                    # Авто-kill через 20 секунд
+
+                    if _notifications_enabled:
+                        time_str = format_time_short(nxt)
+                        message = f"🔴 Босс появился:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
+
+                        for chat_id in list(_subscribers):
+                            try:
+                                sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
+                                # Удалить сообщение через 4 минут
+                                context.job_queue.run_once(
+                                    delete_message_job,
+                                    when=240,
+                                    data={"chat_id": chat_id, "message_id": sent_msg.message_id}
+                                )
+                            except Exception as e:
+                                logger.error(f"Не удалось отправить в {chat_id}: {e}")
+                                # _subscribers.discard(chat_id)
+
+                    # Авто-kill через 20 секунд (всегда, даже при OFF)
                     context.job_queue.run_once(
                         auto_kill_job,
                         when=20,
@@ -977,21 +1008,23 @@ async def tick_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                         notification_key = (boss.id, key_base, interval)
                         if notification_key not in _sent_notifications:
                             _sent_notifications.add(notification_key)
-                            time_str = format_time_short(nxt)
-                            message = f"⚠️ Через {interval} минут{'у' if interval == 1 else ''} респ:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
-                            
-                            for chat_id in list(_subscribers):
-                                try:
-                                    sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
-                                    # Удалить сообщение через 5 минут
-                                    context.job_queue.run_once(
-                                        delete_message_job,
-                                        when=300,
-                                        data={"chat_id": chat_id, "message_id": sent_msg.message_id}
-                                    )
-                                except Exception as e:
-                                    logger.error(f"Не удалось отправить в {chat_id}: {e}")
-                                    # _subscribers.discard(chat_id)
+
+                            if _notifications_enabled:
+                                time_str = format_time_short(nxt)
+                                message = f"⚠️ Через {interval} минут{'у' if interval == 1 else ''} респ:\n{time_str} | {boss.id} | {boss.name} | {boss.spawn_chance_percent}%"
+
+                                for chat_id in list(_subscribers):
+                                    try:
+                                        sent_msg = await context.bot.send_message(chat_id=chat_id, text=message)
+                                        # Удалить сообщение через 5 минут
+                                        context.job_queue.run_once(
+                                            delete_message_job,
+                                            when=300,
+                                            data={"chat_id": chat_id, "message_id": sent_msg.message_id}
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Не удалось отправить в {chat_id}: {e}")
+                                        # _subscribers.discard(chat_id)
     finally:
         db.close()
 
@@ -1028,6 +1061,8 @@ def main() -> None:
     app.add_handler(CommandHandler("admin_del", cmd_admin_del))
     app.add_handler(CommandHandler("admin_list", cmd_admin_list))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("on", cmd_on))
+    app.add_handler(CommandHandler("off", cmd_off))
     
     # Обработчик загрузки файлов БД
     app.add_handler(MessageHandler(filters.Document.ALL, handle_db_restore))
